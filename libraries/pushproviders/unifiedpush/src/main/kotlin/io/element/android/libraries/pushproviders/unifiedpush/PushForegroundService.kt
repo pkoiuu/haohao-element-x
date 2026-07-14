@@ -27,8 +27,10 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkRequest
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -83,21 +85,38 @@ class PushForegroundService : Service() {
     // HaohaoChat v26.06.4: 网络状态监听，网络恢复时自动重连 WebSocket
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
+    // HaohaoChat v26.06.5: WifiLock 防止 WiFi 休眠 (无 SIM 卡时 WiFi 是唯一网络通道)
+    private var wifiLock: WifiManager.WifiLock? = null
+    // HaohaoChat v26.06.5: WakeLock 确保处理推送消息时 CPU 不休眠
+    private var wakeLock: PowerManager.WakeLock? = null
+
     override fun onCreate() {
         super.onCreate()
         instance = this
         Log.i(LOG_TAG, "onCreate: PushForegroundService created")
         createNotificationChannel()
         registerNetworkCallback()
+        acquireWifiLock()
+        acquireWakeLock()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(LOG_TAG, "onStartCommand: starting foreground")
 
-        // 显示常驻通知 (HaohaoChat v26.06.4: Android 14+ 兼容)
+        // 显示常驻通知
+        // HaohaoChat v26.06.5: 使用 specialUse FGS 类型替代 dataSync
+        // dataSync 在 Android 15+ (targetSdk=36) 有 6h 超时限制，超时后系统强制停止
+        // specialUse 专为无法归入标准类型的场景设计，适合 UnifiedPush 长连接
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+                // Android 15+ (API 35+): 使用 specialUse 类型
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            } else {
+                // Android 14: dataSync 仍可用且无超时限制
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            }
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, fgsType)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
@@ -122,12 +141,46 @@ class PushForegroundService : Service() {
         super.onDestroy()
         Log.i(LOG_TAG, "onDestroy: stopping WebSocket")
         unregisterNetworkCallback()
+        releaseWifiLock()
+        releaseWakeLock()
         try {
             wsClient?.disconnect()
             wsClient = null
         } catch (_: Exception) {}
         currentTopic = null
         instance = null
+    }
+
+    // HaohaoChat v26.06.5: Android 15+ FGS 超时回调
+    // dataSync 类型有 6h 超时限制，specialUse 类型也有超时
+    // 超时后系统会强制停止 FGS，需要在此安排 WorkManager 恢复
+    override fun onTimeout(startId: Int) {
+        super.onTimeout(startId)
+        Log.w(LOG_TAG, "⚠️ FGS onTimeout called (startId=$startId) — system requested FGS stop")
+        // 安排 WorkManager 在短延迟后重新启动推送服务
+        scheduleRecoveryViaWorkManager()
+        // 主动停止服务，避免系统强制杀死
+        stopSelf(startId)
+    }
+
+    /**
+     * 通过 WorkManager 安排服务恢复
+     * Android 15+ FGS 超时后不能直接重启 FGS，必须通过 WorkManager expedited
+     */
+    private fun scheduleRecoveryViaWorkManager() {
+        try {
+            val request = androidx.work.OneTimeWorkRequestBuilder<PushServiceRecoveryWorker>()
+                .setInitialDelay(5, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+            androidx.work.WorkManager.getInstance(this).enqueueUniqueWork(
+                "push_service_recovery",
+                androidx.work.ExistingWorkPolicy.REPLACE,
+                request
+            )
+            Log.i(LOG_TAG, "Scheduled PushServiceRecoveryWorker via WorkManager")
+        } catch (e: Exception) {
+            Log.e(LOG_TAG, "Failed to schedule recovery worker", e)
+        }
     }
 
     // ==================== SharedPreferences 持久化 ====================
@@ -205,6 +258,69 @@ class PushForegroundService : Service() {
         networkCallback = null
     }
 
+    // ==================== WifiLock & WakeLock (v26.06.5) ====================
+
+    // HaohaoChat v26.06.5: WifiLock 防止 WiFi 在屏幕关闭时休眠
+    // 无 SIM 卡时 WiFi 是唯一网络通道，WiFi 休眠 = 推送断开
+    // WIFI_MODE_FULL_HIGH_PERF: 最高性能模式，不降低 WiFi 功耗
+    private fun acquireWifiLock() {
+        try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            wifiLock = wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "haohao_push_wifi_lock")
+            wifiLock?.let { lock ->
+                lock.setReferenceCounted(false)
+                if (!lock.isHeld) {
+                    lock.acquire()
+                    Log.i(LOG_TAG, "✅ WifiLock acquired (WIFI_MODE_FULL_HIGH_PERF)")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "Failed to acquire WifiLock", e)
+        }
+    }
+
+    private fun releaseWifiLock() {
+        try {
+            wifiLock?.let { lock ->
+                if (lock.isHeld) {
+                    lock.release()
+                    Log.i(LOG_TAG, "WifiLock released")
+                }
+            }
+            wifiLock = null
+        } catch (_: Exception) {}
+    }
+
+    // HaohaoChat v26.06.5: WakeLock 确保处理推送消息时 CPU 不休眠
+    // PARTIAL_WAKE_LOCK: 仅保持 CPU 运行，不点亮屏幕
+    private fun acquireWakeLock() {
+        try {
+            val powerManager = applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "haohao_push_wake_lock")
+            wakeLock?.let { lock ->
+                lock.setReferenceCounted(false)
+                if (!lock.isHeld) {
+                    lock.acquire()
+                    Log.i(LOG_TAG, "✅ WakeLock acquired (PARTIAL_WAKE_LOCK)")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "Failed to acquire WakeLock", e)
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let { lock ->
+                if (lock.isHeld) {
+                    lock.release()
+                    Log.i(LOG_TAG, "WakeLock released")
+                }
+            }
+            wakeLock = null
+        } catch (_: Exception) {}
+    }
+
     /**
      * 主动重连 WebSocket（供外部调用）
      */
@@ -274,6 +390,12 @@ class PushForegroundService : Service() {
                     .putString(PREF_KEY_LAST_MSG_ID, id)
                     .apply()
             } catch (_: Exception) {}
+        }
+
+        // HaohaoChat v26.06.5: 认证失败回调 — 通知用户服务端 ACL 配置错误
+        wsClient!!.onAuthFailed = {
+            Log.e(LOG_TAG, "🚫 WebSocket auth failed! ntfy ACL may be 'write-only', need 'read-write'")
+            updateNotification("⚠️ 推送认证失败 - 请检查服务端 ACL 配置")
         }
 
         val connected = wsClient!!.connect(topic) { message ->

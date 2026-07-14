@@ -11,6 +11,8 @@
     <!-- 推送前台服务所需权限 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- HaohaoChat v26.06.5: specialUse FGS 类型 (Android 15+ 替代 dataSync) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- HaohaoChat v26.06.4: 网络状态监听权限 -->
@@ -57,12 +59,17 @@
         </receiver>
 
         <!-- HaohaoChat 推送前台服务 — 保持 WebSocket 后台存活 -->
+        <!-- HaohaoChat v26.06.5: specialUse FGS 类型，避免 Android 15+ dataSync 6h 超时 -->
         <service
             android:name=".PushForegroundService"
-            android:foregroundServiceType="dataSync"
+            android:foregroundServiceType="specialUse|dataSync"
             android:enabled="true"
             android:exported="false"
-            android:stopWithTask="false" />
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="UnifiedPush push notification delivery via persistent WebSocket connection" />
+        </service>
 
         <!-- HaohaoChat v26.06.4: 设备重启后自动启动推送服务 -->
         <receiver

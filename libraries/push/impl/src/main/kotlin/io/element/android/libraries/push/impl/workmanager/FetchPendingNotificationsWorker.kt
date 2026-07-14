@@ -40,6 +40,7 @@ import io.element.android.services.analytics.api.finishLongRunningTransaction
 import io.element.android.services.analytics.api.recordTransaction
 import io.element.android.services.analyticsproviders.api.AnalyticsTransaction
 import io.element.android.services.toolbox.api.systemclock.SystemClock
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
@@ -75,71 +76,100 @@ class FetchPendingNotificationsWorker(
 
         // Fetch pending requests in the last 24 hours
         val fetchSince = Instant.fromEpochMilliseconds(systemClock.epochMillis()).minus(1.days)
-        val requests = pushHistoryService.getPendingPushRequests(sessionId, fetchSince).getOrNull() ?: return Result.failure()
 
-        pushHistoryService.removeOldPushRequests(sessionId).onFailure {
-            Timber.e(it, "Could not remove outdated push requests")
-        }
+        // HaohaoChat v26.06.5: 批量处理循环
+        // 使用 KEEP 策略后，运行中的 Worker 完成时可能有新的 PENDING 请求
+        // 此循环确保同一 Worker 实例处理所有积压的推送请求，避免延迟
+        var totalProcessed = 0
+        var maxIterations = 10
+        var lastHadNetworkError = false
 
-        if (requests.isEmpty()) {
-            Timber.d("No pending notifications to fetch, returning early")
-            return Result.success()
-        }
+        while (maxIterations-- > 0) {
+            val requests = pushHistoryService.getPendingPushRequests(sessionId, fetchSince).getOrNull() ?: return Result.failure()
 
-        checkNetworkConnection(requests)?.let { failure -> return failure }
+            pushHistoryService.removeOldPushRequests(sessionId).onFailure {
+                Timber.e(it, "Could not remove outdated push requests")
+            }
 
-        Timber.d("Fetching ${requests.size} push requests")
+            if (requests.isEmpty()) {
+                Timber.d("No pending notifications to fetch (iteration ${10 - maxIterations}), returning")
+                break
+            }
 
-        val pendingAnalyticTransactions = requests.mapNotNull { request ->
-            analyticsService.finishLongRunningTransaction(AnalyticsLongRunningTransaction.PushToWorkManager(request.eventId))
-            val parent = analyticsService.getLongRunningTransaction(AnalyticsLongRunningTransaction.PushToNotification(request.eventId))
-            val transactionName = "WorkManager to event fetched"
-            parent?.startChild(transactionName)?.let { request.eventId to it }
-        }.toMap()
+            Timber.d("Iteration ${10 - maxIterations}: Found ${requests.size} pending push requests (total processed: $totalProcessed)")
 
-        Timber.d("Processing notification requests for session $sessionId")
-        val results = eventResolver.resolveEvents(sessionId, requests)
-            .fold(
-                onSuccess = { results ->
-                    for ((_, transaction) in pendingAnalyticTransactions) {
-                        transaction.finish()
+            checkNetworkConnection(requests)?.let { failure -> return failure }
+
+            Timber.d("Fetching ${requests.size} push requests")
+
+            val pendingAnalyticTransactions = requests.mapNotNull { request ->
+                analyticsService.finishLongRunningTransaction(AnalyticsLongRunningTransaction.PushToWorkManager(request.eventId))
+                val parent = analyticsService.getLongRunningTransaction(AnalyticsLongRunningTransaction.PushToNotification(request.eventId))
+                val transactionName = "WorkManager to event fetched"
+                parent?.startChild(transactionName)?.let { request.eventId to it }
+            }.toMap()
+
+            Timber.d("Processing notification requests for session $sessionId")
+            val results = eventResolver.resolveEvents(sessionId, requests)
+                .fold(
+                    onSuccess = { results ->
+                        for ((_, transaction) in pendingAnalyticTransactions) {
+                            transaction.finish()
+                        }
+                        // Update the resolved results in the queue
+                        resultProcessor.emit(results)
+                        results
+                    },
+                    onFailure = { throwable ->
+                        // This is a failure at the fetch notification setup, not a failure for a single fetch notification operation
+                        return handleSetupError(sessionId, requests, pendingAnalyticTransactions, throwable)
                     }
-                    // Update the resolved results in the queue
-                    resultProcessor.emit(results)
+                )
 
-                    results
-                },
-                onFailure = { throwable ->
-                    // This is a failure at the fetch notification setup, not a failure for a single fetch notification operation
-                    return handleSetupError(sessionId, requests, pendingAnalyticTransactions, throwable)
-                }
-            )
-
-        val updatedRequests = mutableListOf<PushRequest>()
-        for (request in requests) {
-            val result = results[request] ?: continue
-            result.fold(
-                onSuccess = { updatedRequests.add(request.copy(status = PushRequestStatus.SUCCESS.value)) },
-                onFailure = { exception ->
-                    if (exception is ClientException && exception.isNetworkError()) {
-                        // Reset to pending so we can retry it later
-                        updatedRequests.add(request.copy(status = PushRequestStatus.PENDING.value))
-                    } else {
-                        updatedRequests.add(request.copy(status = PushRequestStatus.FAILED.value))
+            val updatedRequests = mutableListOf<PushRequest>()
+            for (request in requests) {
+                val result = results[request] ?: continue
+                result.fold(
+                    onSuccess = { updatedRequests.add(request.copy(status = PushRequestStatus.SUCCESS.value)) },
+                    onFailure = { exception ->
+                        if (exception is ClientException && exception.isNetworkError()) {
+                            // Reset to pending so we can retry it later
+                            updatedRequests.add(request.copy(status = PushRequestStatus.PENDING.value))
+                            lastHadNetworkError = true
+                        } else {
+                            updatedRequests.add(request.copy(status = PushRequestStatus.FAILED.value))
+                        }
                     }
-                }
-            )
+                )
+            }
+
+            Timber.d("Notifications processed successfully (batch size: ${requests.size})")
+
+            pushHistoryService.insertOrUpdatePushRequests(updatedRequests)
+            totalProcessed += requests.size
+
+            analyticsService.recordTransaction("Opportunistic sync", "opportunistic_sync") {
+                performOpportunisticSyncIfNeeded(mapOf(sessionId to requests))
+            }
+
+            // 短暂让出执行权，避免 CPU 占用过高
+            if (maxIterations > 0) {
+                delay(100)
+            }
         }
 
-        Timber.d("Notifications processed successfully")
+        Timber.d("FetchNotificationsWorker completed. Total processed: $totalProcessed, remaining iterations: $maxIterations")
 
-        pushHistoryService.insertOrUpdatePushRequests(updatedRequests)
-
-        analyticsService.recordTransaction("Opportunistic sync", "opportunistic_sync") {
-            performOpportunisticSyncIfNeeded(mapOf(sessionId to requests))
+        // 如果还有未处理的请求（超过 10 轮），返回 retry 让系统重新调度
+        if (maxIterations <= 0) {
+            val remaining = pushHistoryService.getPendingPushRequests(sessionId, fetchSince).getOrNull()
+            if (!remaining.isNullOrEmpty()) {
+                Timber.w("Reached max iterations with ${remaining.size} pending requests, returning retry")
+                return Result.retry()
+            }
         }
 
-        return if (updatedRequests.any { it.status == PushRequestStatus.PENDING.value }) Result.retry() else Result.success()
+        return if (lastHadNetworkError) Result.retry() else Result.success()
     }
 
     private suspend fun performOpportunisticSyncIfNeeded(

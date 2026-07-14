@@ -42,6 +42,9 @@ dependencies {
 
     implementation(libs.serialization.json)
 
+    // HaohaoChat v26.06.5: WorkManager 用于 FGS 超时恢复和设备重启后服务启动
+    implementation(libs.androidx.workmanager.runtime)
+
     // UnifiedPush library
     api(libs.unifiedpush)
 
