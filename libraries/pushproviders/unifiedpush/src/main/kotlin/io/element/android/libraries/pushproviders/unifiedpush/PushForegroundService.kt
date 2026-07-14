@@ -118,7 +118,8 @@ class PushForegroundService : Service() {
             }
             ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, fgsType)
         } else {
-            startForeground(NOTIFICATION_ID, notification)
+            // Android 13 及以下: 使用 ServiceCompat 统一调用
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, 0)
         }
 
         // HaohaoChat: 从 intent 获取 topic，或从 SharedPreferences 恢复（服务被 kill 后重启）
