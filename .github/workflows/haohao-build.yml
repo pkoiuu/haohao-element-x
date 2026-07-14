@@ -1,0 +1,87 @@
+# HaohaoChat 自定义构建 workflow
+# 构建 FDroid Release APK (arm64-v8a)，输出为 GitHub Artifact
+#
+# 注意: 此 workflow 独立于原项目的 build.yml，不影响原开发者的 CI 配置
+# 原项目的 workflow 在 fork 仓库中可通过 Settings > Actions 禁用
+
+name: Haohao Build
+
+on:
+  # 手动触发（在 Actions 页面点击 Run workflow）
+  workflow_dispatch:
+  # push 到 main/master/develop 分支时自动构建
+  push:
+    branches: [ main, master, develop ]
+
+permissions: {}
+
+env:
+  # Gradle JVM 参数（CI 环境给大内存）
+  GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx8g -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8 -XX:+HeapDumpOnOutOfMemoryError -XX:+UseG1GC -Dkotlin.daemon.jvm.options=-Xmx4g
+  CI_GRADLE_ARG_PROPERTIES: --stacktrace --no-configuration-cache
+
+jobs:
+  build:
+    name: Build FDroid Release APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # 同一分支的新构建会取消旧构建
+    concurrency:
+      group: haohao-build-${{ github.ref }}
+      cancel-in-progress: true
+
+    steps:
+      # 1. 释放磁盘空间（Ubuntu runner 只有 14GB 可用）
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+        with:
+          tool-cache: true
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: true
+          swap-storage: false
+
+      # 2. 检出代码（不需要 enterprise submodule，FOSS 构建）
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      # 3. 安装 JDK 21
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      # 4. 配置 Gradle（自动缓存依赖和构建结果）
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master' }}
+
+      # 5. 移除 Windows 专用的 AAPT2 覆盖配置
+      #    Linux CI 上 Maven AAPT2 工作正常，不需要 build-tools 覆盖
+      - name: Remove Windows AAPT2 override
+        run: |
+          sed -i '/android.aapt2FromMavenOverride/d' gradle.properties
+          echo "=== gradle.properties after cleanup ==="
+          cat gradle.properties
+
+      # 6. 构建 FDroid Release APK
+      #    -x lint: 跳过 lint 检查（个人构建不需要）
+      #    Rust SDK 从 Maven 自动下载（releaseImplementation），不需要本地 .aar
+      - name: Build APK
+        run: ./gradlew :app:assembleFdroidRelease -x lint $CI_GRADLE_ARG_PROPERTIES
+
+      # 7. 上传 APK 为 Artifact（保留 30 天）
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: haohao-fdroid-release-apk
+          path: app/build/outputs/apk/fdroid/release/*.apk
+          retention-days: 30
+          compression-level: 0
