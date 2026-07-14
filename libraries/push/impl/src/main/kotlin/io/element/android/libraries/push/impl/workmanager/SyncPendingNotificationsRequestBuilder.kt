@@ -62,7 +62,11 @@ class DefaultSyncPendingNotificationsRequestBuilder(
     override suspend fun build(): Result<List<WorkManagerRequestWrapper>> {
         val type = WorkManagerWorkerType.Unique(
             name = workManagerTag(sessionId = sessionId, requestType = WorkManagerRequestType.NOTIFICATION_SYNC),
-            policy = ExistingWorkPolicy.APPEND_OR_REPLACE,
+            // HaohaoChat v26.06.4: APPEND_OR_REPLACE → KEEP
+            // APPEND_OR_REPLACE 为每条推送创建 Worker 并串行排队，导致大量延迟
+            // KEEP: 如果同名 Work 已在运行，丢弃新请求。运行中的 Worker 会批量处理所有 PENDING 请求
+            // Worker 完成后检查是否有新 PENDING 请求，有则 Result.retry() 触发再次执行
+            policy = ExistingWorkPolicy.KEEP,
         )
 
         val networkRequestBuilder = NetworkRequest.Builder()

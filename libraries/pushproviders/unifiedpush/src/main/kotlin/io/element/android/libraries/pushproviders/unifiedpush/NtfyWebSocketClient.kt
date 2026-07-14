@@ -1,6 +1,13 @@
 /*
  * HaohaoChat 内置 ntfy WebSocket 客户端
  * 技术实现: 基于 OkHttp 5.x 的 ntfy WebSocket 长连接
+ *
+ * v26.06.4 修复:
+ * - lastMessageId 为 null 时使用 since=all，避免断连期间消息永久丢失
+ * - connect() 异常时也触发重连，防止重连链路断裂
+ * - disconnect() 使用 cancel() 替代 close()，避免触发 onClosed 导致僵尸重连
+ * - 真正的指数退避重连策略（3s → 6s → 12s → ... → 最大 60s）
+ * - 添加 isDisconnecting 标志，防止旧 listener 回调干扰新连接
  */
 
 package io.element.android.libraries.pushproviders.unifiedpush
@@ -19,43 +26,33 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import java.util.concurrent.TimeUnit
+import kotlin.math.min
 import kotlin.random.Random
 
 private const val LOG_TAG = "NtfyWS"
 
-/**
- * ntfy WebSocket 客户端
- * 连接到 ntfy 服务器的 /{topic}/ws 端点接收实时推送
- */
 class NtfyWebSocketClient(
     private val config: EmbeddedNtfyConfig = EmbeddedNtfyConfig(),
 ) {
     private var webSocket: WebSocket? = null
     private var client: OkHttpClient? = null
     private var scope: CoroutineScope? = null
-    // HaohaoChat: 将 reconnectScope 作为实例变量管理，在 disconnect() 中取消
-    // 原代码每次 scheduleReconnect 都创建独立 scope，disconnect() 无法取消，导致僵尸重连
     private var reconnectScope: CoroutineScope? = null
-    private var heartbeatJob: Job? = null
     private var currentTopic: String? = null
     private var messageListener: ((message: String) -> Unit)? = null
 
-    /**
-     * 最后收到的消息 ID，用于重连时通过 since= 参数恢复断连期间的消息
-     */
     @Volatile
     private var lastMessageId: String? = null
 
-    /**
-     * 消息 ID 变化回调，用于外部持久化 lastMessageId
-     * HaohaoChat: PushForegroundService 设置此回调，将 lastMessageId 保存到 SharedPreferences
-     * 进程重启后创建新 NtfyWebSocketClient 时可恢复，避免断连期间消息丢失
-     */
+    // HaohaoChat v26.06.4: 防止僵尸重连的标志
+    @Volatile
+    private var isDisconnecting = false
+
+    // HaohaoChat v26.06.4: 指数退避计数器
+    private var reconnectAttempts = 0
+
     var onMessageIdUpdated: ((id: String) -> Unit)? = null
 
-    /**
-     * 恢复上次的消息 ID（进程重启后从 SharedPreferences 恢复）
-     */
     fun restoreLastMessageId(id: String?) {
         if (id != null) {
             lastMessageId = id
@@ -63,14 +60,10 @@ class NtfyWebSocketClient(
         }
     }
 
-    /**
-     * 连接到 ntfy WebSocket
-     * @param topic ntfy topic 名称（不含前缀）
-     * @param onMessage 收到消息时的回调
-     */
     fun connect(topic: String, onMessage: (String) -> Unit): Boolean {
         return try {
             disconnect()
+            isDisconnecting = false
 
             currentTopic = topic
             messageListener = onMessage
@@ -91,22 +84,28 @@ class NtfyWebSocketClient(
             webSocket = client!!.newWebSocket(request, object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     super.onOpen(webSocket, response)
+                    reconnectAttempts = 0
                     Log.i(LOG_TAG, "WS connected to $topic")
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     super.onMessage(webSocket, text)
                     Log.d(LOG_TAG, "WS message received (${text.length} chars)")
-                    // 仅处理 event=message 的消息，忽略 open/keepalive 等控制事件
-                    if (!text.contains("\"event\":\"message\"")) {
-                        Log.d(LOG_TAG, "Ignoring non-message event: ${text.take(80)}")
+                    // 使用 JSON 解析判断事件类型，避免 "message_delete" 误判
+                    try {
+                        val json = org.json.JSONObject(text)
+                        val event = json.optString("event")
+                        if (event != "message") {
+                            Log.d(LOG_TAG, "Ignoring non-message event: ${text.take(80)}")
+                            return
+                        }
+                        json.optString("id")?.takeIf { it.isNotEmpty() }?.let { id ->
+                            lastMessageId = id
+                            try { onMessageIdUpdated?.invoke(id) } catch (_: Exception) {}
+                        }
+                    } catch (e: Exception) {
+                        Log.w(LOG_TAG, "Failed to parse WS message JSON: ${text.take(80)}")
                         return
-                    }
-                    // 记录消息 ID 用于重连恢复
-                    extractMessageId(text)?.let { id ->
-                        lastMessageId = id
-                        // HaohaoChat: 通知外部持久化 lastMessageId
-                        try { onMessageIdUpdated?.invoke(id) } catch (_: Exception) {}
                     }
                     try {
                         messageListener?.invoke(text)
@@ -115,39 +114,52 @@ class NtfyWebSocketClient(
                     }
                 }
 
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    super.onFailure(webSocket, t, response)
-                    Log.e(LOG_TAG, "WS connection failed: ${t.message}", t)
-                    scheduleReconnect(topic, onMessage)
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                    super.onClosing(webSocket, code, reason)
+                    Log.d(LOG_TAG, "WS closing: code=$code reason=$reason")
+                    // 不在这里调用 scheduleReconnect，由 onClosed 统一处理
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                     super.onClosed(webSocket, code, reason)
                     Log.w(LOG_TAG, "WS closed: code=$code reason=$reason")
-                    scheduleReconnect(topic, onMessage)
+                    // HaohaoChat v26.06.4: 只有非主动断开时才重连
+                    if (!isDisconnecting) {
+                        scheduleReconnect(topic, onMessage)
+                    }
+                }
+
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    super.onFailure(webSocket, t, response)
+                    Log.e(LOG_TAG, "WS connection failed: ${t.message}", t)
+                    // HaohaoChat v26.06.4: 只有非主动断开时才重连
+                    if (!isDisconnecting) {
+                        scheduleReconnect(topic, onMessage)
+                    }
                 }
             })
 
             true
         } catch (e: Exception) {
             Log.e(LOG_TAG, "Failed to create WS connection", e)
+            // HaohaoChat v26.06.4: connect 异常时也要触发重连，防止链路断裂
+            if (!isDisconnecting) {
+                scheduleReconnect(topic, onMessage)
+            }
             false
         }
     }
 
-    /**
-     * 断开连接
-     */
     fun disconnect() {
+        isDisconnecting = true
         try {
-            heartbeatJob?.cancel()
-            heartbeatJob = null
-            // HaohaoChat: 取消挂起的重连任务
             reconnectScope?.cancel()
             reconnectScope = null
-            webSocket?.close(1000, "Client disconnect")
+            // HaohaoChat v26.06.4: 使用 cancel() 替代 close()
+            // close() 会触发 onClosed 回调导致僵尸重连，cancel() 立即终止不触发回调
+            webSocket?.cancel()
             webSocket = null
-            client?.dispatcher?.executorService?.shutdown()
+            client?.dispatcher?.executorService?.shutdownNow()
             client = null
             scope?.cancel()
             scope = null
@@ -156,22 +168,21 @@ class NtfyWebSocketClient(
         } catch (_: Exception) {}
     }
 
-    /**
-     * 检查是否已连接
-     */
     fun isConnected(): Boolean = webSocket != null
 
     private fun scheduleReconnect(topic: String, onMessage: (String) -> Unit) {
-        // HaohaoChat: 使用实例变量 reconnectScope，在 disconnect() 中可被取消
-        // 原代码每次创建独立 scope，disconnect() 无法取消，导致僵尸重连
         reconnectScope?.cancel()
         reconnectScope = CoroutineScope(Dispatchers.IO)
         reconnectScope!!.launch {
-            // 指数退避: 基础 5 秒，加随机抖动
-            val delayMs = (5 + Random.nextLong(1, 15)) * 1000L
-            Log.w(LOG_TAG, "Scheduling reconnect in ${delayMs / 1000}s")
+            reconnectAttempts++
+            // HaohaoChat v26.06.4: 真正的指数退避
+            // 基础 3s，每次翻倍: 3, 6, 12, 24, 48, 60, 60, 60...
+            val baseDelay = min(3000L * (1L shl min(reconnectAttempts - 1, 5)), 60_000L)
+            val jitter = Random.nextLong(0, 2000)
+            val delayMs = baseDelay + jitter
+            Log.w(LOG_TAG, "Scheduling reconnect #$reconnectAttempts in ${delayMs / 1000}s")
             delay(delayMs)
-            if (isActive) {
+            if (isActive && !isDisconnecting) {
                 Log.i(LOG_TAG, "Attempting reconnect...")
                 connect(topic, onMessage)
             }
@@ -181,21 +192,9 @@ class NtfyWebSocketClient(
     private fun buildWsUrl(topic: String): String {
         val baseUrl = config.serverUrl.removeSuffix("/")
         val wsBase = baseUrl.replace("https://", "wss://").replace("http://", "ws://")
-        // 重连时附加 since= 参数，恢复断连期间的消息
-        // ntfy 支持 since=<message_id> 获取该 ID 之后的所有缓存消息
-        val sinceParam = lastMessageId?.let { "?since=$it" } ?: ""
+        // HaohaoChat v26.06.4: lastMessageId 为 null 时使用 since=all 回放所有缓存消息
+        // ntfy 默认缓存 12h，不会返回过多消息
+        val sinceParam = lastMessageId?.let { "?since=$it" } ?: "?since=all"
         return "$wsBase/$topic/ws$sinceParam"
-    }
-
-    /**
-     * 从 ntfy JSON 消息中提取消息 ID
-     */
-    private fun extractMessageId(text: String): String? {
-        return try {
-            val json = org.json.JSONObject(text)
-            json.optString("id", null)
-        } catch (e: Exception) {
-            null
-        }
     }
 }

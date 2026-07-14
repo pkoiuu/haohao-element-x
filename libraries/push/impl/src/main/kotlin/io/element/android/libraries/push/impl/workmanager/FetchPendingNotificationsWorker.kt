@@ -68,7 +68,10 @@ class FetchPendingNotificationsWorker(
         }.getOrNull() ?: return Result.failure()
 
         // We can stop the foreground service and unlock the wakelock, since the work is now running and the device should be kept awake
-        fetchPushForegroundServiceManager.stop()
+        // HaohaoChat v26.06.4: stop() 可能阻塞 0-5s 等待 foreground service，缩短到 1s
+        withTimeoutOrNull(1.seconds) {
+            fetchPushForegroundServiceManager.stop()
+        }
 
         // Fetch pending requests in the last 24 hours
         val fetchSince = Instant.fromEpochMilliseconds(systemClock.epochMillis()).minus(1.days)
@@ -157,8 +160,9 @@ class FetchPendingNotificationsWorker(
             parent?.startChild("Waiting for network connectivity", "await_network")
         }
 
-        // Wait for network to be available, but not more than 10 seconds
-        val hasNetwork = withTimeoutOrNull(10.seconds) {
+        // Wait for network to be available, but not more than 5 seconds
+        // HaohaoChat v26.06.4: 10s → 5s, 减少无网络时的等待延迟
+        val hasNetwork = withTimeoutOrNull(5.seconds) {
             networkMonitor.connectivity.first { it == NetworkStatus.Connected }
         } != null
 

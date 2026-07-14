@@ -24,10 +24,14 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 
 /**
  * 推送前台服务 — 保持 WebSocket 连接在后台存活
@@ -76,19 +80,27 @@ class PushForegroundService : Service() {
 
     @Volatile private var wsClient: NtfyWebSocketClient? = null
     @Volatile private var currentTopic: String? = null
+    // HaohaoChat v26.06.4: 网络状态监听，网络恢复时自动重连 WebSocket
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     override fun onCreate() {
         super.onCreate()
         instance = this
         Log.i(LOG_TAG, "onCreate: PushForegroundService created")
         createNotificationChannel()
+        registerNetworkCallback()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(LOG_TAG, "onStartCommand: starting foreground")
 
-        // 显示常驻通知
-        startForeground(NOTIFICATION_ID, buildNotification())
+        // 显示常驻通知 (HaohaoChat v26.06.4: Android 14+ 兼容)
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
 
         // HaohaoChat: 从 intent 获取 topic，或从 SharedPreferences 恢复（服务被 kill 后重启）
         val topic = intent?.getStringExtra("topic") ?: getSavedTopic()
@@ -109,6 +121,7 @@ class PushForegroundService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Log.i(LOG_TAG, "onDestroy: stopping WebSocket")
+        unregisterNetworkCallback()
         try {
             wsClient?.disconnect()
             wsClient = null
@@ -152,6 +165,56 @@ class PushForegroundService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    // ==================== 网络状态监听 (v26.06.4) ====================
+
+    // HaohaoChat v26.06.4: 监听网络变化，网络恢复时自动重连 WebSocket
+    // 这是"完全收不到消息"的核心修复：手机无网络时 WebSocket 断开，
+    // 网络恢复后如果没有主动重连，推送将永久不可用
+    private fun registerNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            val request = NetworkRequest.Builder().build()
+            networkCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    Log.i(LOG_TAG, "Network available, reconnecting WebSocket")
+                    val topic = currentTopic
+                    if (topic != null) {
+                        // 网络恢复，主动重连
+                        startWebSocket(topic)
+                    }
+                }
+                override fun onLost(network: Network) {
+                    Log.w(LOG_TAG, "Network lost, WebSocket will reconnect automatically")
+                }
+            }
+            cm.registerNetworkCallback(request, networkCallback!!)
+            Log.i(LOG_TAG, "Network callback registered")
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "Failed to register network callback", e)
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        networkCallback?.let {
+            try {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                cm?.unregisterNetworkCallback(it)
+            } catch (_: Exception) {}
+        }
+        networkCallback = null
+    }
+
+    /**
+     * 主动重连 WebSocket（供外部调用）
+     */
+    fun reconnect() {
+        val topic = currentTopic ?: getSavedTopic()
+        if (topic != null) {
+            Log.i(LOG_TAG, "Manual reconnect to topic=$topic")
+            startWebSocket(topic)
+        }
+    }
 
     /**
      * 启动或切换 WebSocket 连接到指定 topic
